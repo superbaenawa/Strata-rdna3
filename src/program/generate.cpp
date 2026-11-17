@@ -838,6 +838,9 @@ struct Options {
     /// (drop_superseded) after writing the same bytes once more, so on a long single conversation every turn pays a
     /// whole-snapshot copy for nothing.  0 = park every turn, as before.
     int64_t conversation_cache_park_gain = 0;
+    /// port of upstream #5862: --serve: skip the park when the request resumes this conversation and at most this
+    /// many of its live tokens sit past the resume point - the client's stripped answer.  0 = park, as before.
+    int64_t conversation_cache_rewind_keep = 0;
     /// --memory-limit-mib N / STRATA_MEMORY_LIMIT_MIB: the total RAM this engine's container or cgroup may use, for a
     /// container that cannot see its real limit (0 or unset = none; the flag wins over the variable)
     int64_t memory_limit_mib = -1;
@@ -2770,13 +2773,13 @@ int main(int argc, char** argv) {
         else if (a == "--prompt-cache") o.prompt_cache = std::max(0, std::atoi(next("--prompt-cache")));
         else if (a == "--conversation-cache-mib" || a == "--conversation-cache-slots" ||
                  a == "--conversation-cache-min-free-mib" || a == "--conversation-cache-min-tokens" ||
-                 a == "--conversation-cache-park-gain" ||
+                 a == "--conversation-cache-park-gain" || a == "--conversation-cache-rewind-keep" ||
                  a == "--session-min-free-mib" || a == "--memory-limit-mib") {
             const std::string value = next(a.c_str());
             int64_t number = 0;
             const auto result = std::from_chars(value.data(), value.data() + value.size(), number);
             const int64_t limit = (a == "--conversation-cache-slots" || a == "--conversation-cache-min-tokens" ||
-                                   a == "--conversation-cache-park-gain")
+                                   a == "--conversation-cache-park-gain" || a == "--conversation-cache-rewind-keep")
                                       ? INT32_MAX : INT64_MAX / (1024 * 1024);
             if (result.ec != std::errc{} || result.ptr != value.data() + value.size() || number < 0 || number > limit) {
                 std::fprintf(stderr, "%s needs a nonnegative integer within range\n", a.c_str());
@@ -2786,6 +2789,7 @@ int main(int argc, char** argv) {
             else if (a == "--conversation-cache-min-free-mib") o.conversation_cache_min_free_mib = number;
             else if (a == "--conversation-cache-min-tokens") o.conversation_cache_min_tokens = number;
             else if (a == "--conversation-cache-park-gain") o.conversation_cache_park_gain = number;
+            else if (a == "--conversation-cache-rewind-keep") o.conversation_cache_rewind_keep = number;
             else if (a == "--session-min-free-mib") o.session_min_free_mib = number;
             else if (a == "--memory-limit-mib") o.memory_limit_mib = number;
             else o.conversation_cache_slots = (int) number;
@@ -13741,7 +13745,22 @@ int main(int argc, char** argv) {
                                          : 0;
             const bool park_worth = o.conversation_cache_park_gain <= 0 || park_held == 0 ||
                                     (int64_t) live.size() >= (int64_t) park_held + o.conversation_cache_park_gain;
-            if (borrow && !pin_sibling && park_worth) {
+            // port of upstream #5862 (--conversation-cache-rewind-keep N): the request resumes this conversation
+            // and at most N of its live tokens are past the resume point (the client's stripped answer).  A park only
+            // reads, so skipping it cannot change a token; prefix_equal keeps a switch that only shares a system prompt
+            // parking as before.
+            const bool rewind_skip =
+                o.conversation_cache_rewind_keep > 0 && !from_live && resume > 0 && live_ok && !incoming && !borrow &&
+                slot_source < 0 && lent_slot < 0 && req_imgs.empty() &&
+                strata::program::conv_cache::rewind_keep(live.data(), (int64_t) live.size(), ids.data(), resume,
+                                                         o.conversation_cache_rewind_keep);
+            const bool keep_branch = pin_sibling || rewind_skip;
+            if (rewind_skip)
+                std::fprintf(stderr,
+                             "strata serve: conversation cache: skip parking (the rewind keeps %lld of %lld tokens "
+                             "live; %lld past the resume point are not kept)\n",
+                             (long long) resume, (long long) live.size(), (long long) (live.size() - resume));
+            if (borrow && !keep_branch && park_worth) {
                 conversations.guard(parked.serial);   // parking the outgoing conversation must not evict the donor
                 const bool parked_ok = park_current(0);
                 const bool blocked = conversations.guard_blocked();
@@ -13763,7 +13782,7 @@ int main(int argc, char** argv) {
                         return 1;
                     }
                 }
-            } else if ((!from_live || incoming || slot_source >= 0) && !pin_sibling && park_worth &&
+            } else if ((!from_live || incoming || slot_source >= 0) && !keep_branch && park_worth &&
                        !park_current(incoming ? incoming->bytes() : 0)) {
                 std::printf("ERR %s\n", err.c_str());
                 return 1;
