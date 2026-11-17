@@ -300,6 +300,12 @@ void native_gu_rows(const NativeFmt& f, const uint8_t* blob, const void* const* 
         return;
     }
     const int mt_min = native_gu_mt_min(f.gu_type);   // #152
+    // rdna3 port of upstream #6085: STRATA_IQ_FAST=1 (opt-in) takes a lone token of IQ3_XXS / IQ3_S / IQ2_S through
+    // the in-register-lookup rows in ggml-cpu's order (the same bits as the one-token rows below and ggml's dot)
+    // IQ2_S keeps the code-plane one-token rows below (iq2s_gu_rows_1t: 1.17x ggml on Zen 4, where fast_row_x<22> was 0.94x)
+    if (nt == 1 && nt < mt_min && f.tail_off == 0 && avx512 && iq512_fast_on() && f.gu_type != 22 &&
+        iq512_fast_gu_rows_1t(f.gu_type, blob, f.gu_row, f.up_off, (int) f.n_embd, act[0], ff[0], r0, r1))
+        return;
     // IQ3_S below the multi-token rule: the byte-plane kernel, bit for bit ggml-cpu's dot here (2.6x per core on Zen 5;
     // claude_cpubench parity: every IQ3_S layer of both packs).  STRATA_IQ3S_1T=0: ggml's.
     static const bool iq3s_1t = avx512 && iq3s_1t_supported() && [] { const char* v = std::getenv("STRATA_IQ3S_1T"); return v == nullptr || std::atoi(v) != 0; }();

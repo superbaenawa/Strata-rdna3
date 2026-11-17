@@ -34,6 +34,12 @@ bool iq512x_supported(int ggml_type) noexcept;
 void iq512x_rows(int ggml_type, const uint8_t* w, size_t row_bytes, int n, const void* const* act, int nt,
                  float* const* out, int r0, int r1);
 
+/// rdna3 port of upstream #6085 (STRATA_IQ_FAST=1, opt-in): IQ3_XXS / IQ3_S / IQ2_S gate/up rows with in-register
+/// grid lookups, the same bits as the default rows.  iq512_gu_rows takes them for several tokens when on; for one token
+/// native_gu_rows calls iq512_fast_gu_rows_1t (false = not taken).
+bool iq512_fast_on() noexcept;
+bool iq512_fast_gu_rows_1t(int type, const uint8_t* blob, size_t gu_row, size_t up_off, int n, const void* act, float* ff,
+                           int r0, int r1);
 /// IQ2_S gate/up rows for ONE token, bit for bit ggml-cpu's ggml_vec_dot_iq2_s_q8_K (its x86 AVX2 path:
 /// the same 8 int32 lanes per superblock, fma(d, lane, accumf), hsum_float_8, x 0.125), with the grid read as 2-bit
 /// code planes through vpermt2b (a gate and an up row's 64 groups at once) and 64 weights per maddubs/madd.  Needs AVX512 F/BW/VL/VBMI (iq2s_1t_supported).

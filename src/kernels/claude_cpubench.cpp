@@ -89,6 +89,40 @@ int main(int argc,char**argv){
   printf("parity layer %d: %d experts x 6 activations: %lld/%lld rows bitwise\n",layer,G,same,rows);
   return same==rows?0:4;
  }
+ // "fast": the rdna3 port of upstream #6085 (STRATA_IQ_FAST=1).  One token: iq512_fast_gu_rows_1t against
+ // ggml-cpu's dot, bit for bit, every gate/up row of every expert of the ring, 6 activations.  Several tokens: an FNV hash of
+ // iq512_gu_rows' outputs at 2, 3, 4 tokens, to compare between STRATA_IQ_FAST=0 and =1 runs.  Then one core's time.
+ if(argc>5 && std::string(argv[5])=="fast"){
+  const int ty=f.gu_type; if(ty!=18 && ty!=21 && ty!=22){printf("fast: skip (gu type %d)\n",ty);return 0;}
+  const int FF=(int)f.n_ff;const auto dot=ggml_get_type_traits_cpu((ggml_type)ty)->vec_dot;
+  struct alignas(64) NA{uint8_t b[c::kNativeActBytes];};std::vector<NA> acts(6);std::mt19937 r2(4242);std::vector<float> xv(c::H);
+  for(int k=0;k<6;++k){for(int i=0;i<(int)c::H;++i){float v=float(int(r2()%65537)-32768)/16384.f;
+    if(k==1)v*=1e4f; if(k==2)v*=1e-4f; if(k==3 && (r2()%8))v=0; if(k==4)v=(i%97==0)?127.f:-0.01f*(i%5); if(k==5)v=std::sin(i*0.37f)*3;xv[i]=v;}
+   c::native_quant_act(f,xv.data(),acts[k].b);}
+  printf("fast: STRATA_IQ_FAST on=%d\n",(int)c::iq512_fast_on());
+  if(c::iq512_fast_on()){
+   long long rows=0,same=0;std::vector<float> got(FF);
+   for(int e=0;e<G;++e){const uint8_t* blob=blobs+size_t(e)*f.bytes;
+    for(int k=0;k<6;++k){
+     if(!c::iq512_fast_gu_rows_1t(ty,blob,f.gu_row,f.up_off,(int)f.n_embd,acts[k].b,got.data(),0,FF)){printf("fast: 1t not taken\n");return 5;}
+     for(int r=0;r<FF;++r){float g=0,u=0;dot((int)f.n_embd,&g,0,blob+size_t(r)*f.gu_row,0,acts[k].b,0,1);dot((int)f.n_embd,&u,0,blob+f.up_off+size_t(r)*f.gu_row,0,acts[k].b,0,1);
+      const float ref=(g/(1.f+std::exp(-g)))*u;++rows;same+=std::memcmp(&ref,&got[r],4)==0;}
+    }}
+   printf("fast 1t parity layer %d type %d: %d experts: %lld/%lld rows bitwise vs ggml\n",layer,ty,G,same,rows);
+   if(same!=rows)return 4;
+  }
+  uint64_t hsh=14695981039346656037ull;std::vector<float> o(4*FF);
+  for(int e=0;e<G;++e){const uint8_t* blob=blobs+size_t(e)*f.bytes;
+   for(int nt=2;nt<=4;++nt){const void* ap[4];float* op[4];for(int t=0;t<nt;++t){ap[t]=acts[(e+t)%6].b;op[t]=o.data()+t*FF;}
+    c::iq512_gu_rows(ty,blob,f.gu_row,f.up_off,(int)f.n_embd,ap,nt,op,0,FF);
+    hsh^=hash(o.data(),size_t(nt)*FF*4);hsh*=1099511628211ull;}}
+  printf("fast multi-token hash layer %d type %d: %016llx\n",layer,ty,(unsigned long long)hsh);
+  const int reps=200;const uint8_t* blob=blobs;std::vector<float> a(FF);float* fa=a.data();const void* ap[1]={acts[0].b};
+  auto time=[&](auto&& fn){fn();auto t0=std::chrono::steady_clock::now();for(int r=0;r<reps;++r)fn();return std::chrono::duration<double,std::micro>(std::chrono::steady_clock::now()-t0).count()/reps;};
+  const double tn=time([&]{c::native_gu_rows(f,blob,ap,1,&fa,0,FF);});
+  printf("fast gu nt 1 via dispatch: %.1f us (%.2f GB/s/core)\n",tn,2.0*f.up_off/tn/1e3);
+  return 0;
+ }
  // "iq2s": the IQ2_S one-token rows (iq2s_rows_1t / iq2s_gu_rows_1t) against ggml-cpu's dot, bit for bit,
  // every gate and up row of every expert of the ring, 6 activations; then one core's gate/up time per expert
  if(argc>5 && std::string(argv[5])=="iq2s"){
