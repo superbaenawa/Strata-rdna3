@@ -4592,6 +4592,8 @@ class Service:
                 # #1317: the quick frozen-engine check does not end an engine whose GPU is busy (a long prompt chunk on a
                 # slow card keeps the GPU at work while the host thread sleeps)
                 self.engine.gpu_busy = lambda: (self.telemetry.snapshot()["now"].get("gpu_util") or 0) >= 10
+            # local patch: no GPU sysfs reads while the engine is unloaded, so the card can runtime-suspend
+            self.telemetry.gpu_idle = lambda: bool(getattr(getattr(self, "engine", None), "unloaded", False))
 
     def _tok_s(self):
         """tok/s over the last RATE_WINDOW_S seconds.  Returns 0.0 while nothing is generating.  With parallel requests:

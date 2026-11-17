@@ -601,7 +601,16 @@ class Telemetry:
 
     def sample(self):
         s = {}
-        if self.gpu.ok():
+        # local patch: while the engine is unloaded (idle_unload_s) leave the GPU's sysfs alone, since every read of
+        # gpu_busy_percent / mem_info_vram_* / hwmon resumes an amdgpu card and keeps it out of runtime suspend
+        idle = False
+        gpu_idle = getattr(self, "gpu_idle", None)
+        if gpu_idle:
+            try:
+                idle = bool(gpu_idle())
+            except Exception:  # noqa: BLE001 - telemetry must never take the server down
+                idle = False
+        if self.gpu.ok() and not idle:
             reads = [(i, g.read()) for i, g in self.gpus]
             g = dict(reads[0][1])
             if len(reads) > 1:
