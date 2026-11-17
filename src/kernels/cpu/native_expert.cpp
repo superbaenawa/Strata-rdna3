@@ -307,6 +307,13 @@ void native_gu_rows(const NativeFmt& f, const uint8_t* blob, const void* const* 
         iq3s_gu_rows_1t(blob, f.gu_row, f.up_off, (int) f.n_embd, act[0], ff[0], r0, r1);
         return;
     }
+    // IQ2_S the same way (bit for bit ggml's ggml_vec_dot_iq2_s_q8_K, the grid as 2-bit code planes through
+    // vpermt2b).  STRATA_IQ2S_1T=0: ggml's.
+    static const bool iq2s_1t = avx512 && iq2s_1t_supported() && [] { const char* v = std::getenv("STRATA_IQ2S_1T"); return v == nullptr || std::atoi(v) != 0; }();
+    if (iq2s_1t && f.gu_type == 22 && nt == 1 && nt < mt_min && f.tail_off == 0) {
+        iq2s_gu_rows_1t(blob, f.gu_row, f.up_off, (int) f.n_embd, act[0], ff[0], r0, r1);
+        return;
+    }
     // IQ3_XXS the same way (bit for bit ggml's ggml_vec_dot_iq3_xxs_q8_K).  STRATA_IQ3XXS_1T=0: ggml's.
     static const bool iq3xxs_1t = avx512 && iq3xxs_1t_supported() && [] { const char* v = std::getenv("STRATA_IQ3XXS_1T"); return v == nullptr || std::atoi(v) != 0; }();
     if (iq3xxs_1t && f.gu_type == 18 && nt == 1 && nt < mt_min) {

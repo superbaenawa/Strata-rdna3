@@ -89,6 +89,35 @@ int main(int argc,char**argv){
   printf("parity layer %d: %d experts x 6 activations: %lld/%lld rows bitwise\n",layer,G,same,rows);
   return same==rows?0:4;
  }
+ // "iq2s": the IQ2_S one-token rows (iq2s_rows_1t / iq2s_gu_rows_1t) against ggml-cpu's dot, bit for bit,
+ // every gate and up row of every expert of the ring, 6 activations; then one core's gate/up time per expert
+ if(argc>5 && std::string(argv[5])=="iq2s"){
+  if(f.gu_type!=22 || !c::iq2s_1t_supported()){printf("iq2s: skip (gu type %d)\n",f.gu_type);return 0;}
+  const int FF=(int)f.n_ff;const auto dot=ggml_get_type_traits_cpu((ggml_type)22)->vec_dot;
+  struct alignas(64) NA{uint8_t b[c::kNativeActBytes];};std::vector<NA> acts(6);std::mt19937 r2(4242);std::vector<float> xv(c::H);
+  for(int k=0;k<6;++k){for(int i=0;i<(int)c::H;++i){float v=float(int(r2()%65537)-32768)/16384.f;
+    if(k==1)v*=1e4f; if(k==2)v*=1e-4f; if(k==3 && (r2()%8))v=0; if(k==4)v=(i%97==0)?127.f:-0.01f*(i%5); if(k==5)v=std::sin(i*0.37f)*3;xv[i]=v;}
+   c::native_quant_act(f,xv.data(),acts[k].b);}
+  long long rows=0,same=0;std::vector<float> got(2*FF),gff(FF),rff(FF);
+  for(int e=0;e<G;++e){const uint8_t* blob=blobs+size_t(e)*f.bytes;
+   for(int k=0;k<6;++k){
+    c::iq2s_pair_rows_1t(blob,f.gu_row,f.up_off,(int)f.n_embd,acts[k].b,got.data(),got.data()+FF,0,FF);
+    for(int r=0;r<FF;++r){float g=0,u=0;dot((int)f.n_embd,&g,0,blob+size_t(r)*f.gu_row,0,acts[k].b,0,1);dot((int)f.n_embd,&u,0,blob+f.up_off+size_t(r)*f.gu_row,0,acts[k].b,0,1);
+     rows+=2;same+=(std::memcmp(&g,&got[r],4)==0)+(std::memcmp(&u,&got[FF+r],4)==0);rff[r]=(g/(1.f+std::exp(-g)))*u;}
+    c::iq2s_gu_rows_1t(blob,f.gu_row,f.up_off,(int)f.n_embd,acts[k].b,gff.data(),0,FF);
+    for(int r=0;r<FF;++r){++rows;same+=std::memcmp(&rff[r],&gff[r],4)==0;}
+   }}
+  printf("iq2s parity layer %d: %d experts: %lld/%lld rows bitwise\n",layer,G,same,rows);
+  if(same!=rows)return 4;
+  const int reps=300;const uint8_t* blob=blobs;std::vector<float> a(FF);float* fa=a.data();const void* ap[1]={acts[0].b};
+  auto time=[&](auto&& fn){fn();auto t0=std::chrono::steady_clock::now();for(int r=0;r<reps;++r)fn();return std::chrono::duration<double,std::micro>(std::chrono::steady_clock::now()-t0).count()/reps;};
+  const double tg=time([&]{for(int r=0;r<FF;++r){float g=0,u=0;dot((int)f.n_embd,&g,0,blob+size_t(r)*f.gu_row,0,acts[0].b,0,1);dot((int)f.n_embd,&u,0,blob+f.up_off+size_t(r)*f.gu_row,0,acts[0].b,0,1);fa[r]=(g/(1.f+std::exp(-g)))*u;}});
+  const double tk=time([&]{c::iq2s_gu_rows_1t(blob,f.gu_row,f.up_off,(int)f.n_embd,acts[0].b,fa,0,FF);});
+  const double tn=time([&]{c::native_gu_rows(f,blob,ap,1,&fa,0,FF);});
+  const double by=2.0*f.up_off;
+  printf("iq2s gu nt 1: ggml %.1f us (%.2f GB/s/core)  iq2s_gu_rows_1t %.1f us (%.2f GB/s/core)  %.2fx  [dispatch now %.1f us]\n",tg,by/tg/1e3,tk,by/tk/1e3,tg/tk,tn);
+  return 0;
+ }
  // "dot": one core, one token, one warm expert: the gate/up rows (and the down rows) through the production dispatch
  // (ggml-cpu's dot at one token) against the AVX-512 kernel at one token, outputs compared bit for bit (2026-10-15)
  if(argc>5 && std::string(argv[5])=="dot"){
