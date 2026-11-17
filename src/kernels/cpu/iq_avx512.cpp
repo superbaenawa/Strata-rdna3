@@ -1325,6 +1325,65 @@ inline void iq2s_pair_1t(const uint8_t* grow, const uint8_t* urow, int nb, const
     const block_iq2_s* xg = (const block_iq2_s*) grow;
     const block_iq2_s* xu = (const block_iq2_s*) urow;
     __m256 accg = _mm256_setzero_ps(), accu = _mm256_setzero_ps();
+#if defined(_MSC_VER) && !defined(__clang__)
+    // two superblocks per pass of the tables with named registers (L0/H0, L1/H1), no lambda and no register
+    // arrays: MSVC kept those in memory (Zen 5, MSVC 19.44: 186-201 us per expert, ggml 143-163; this form 102-103 -
+    // MozgiDev's rewrite on Niko1221/Strata#6085).  The per-superblock arithmetic is unchanged, so the bits are.
+    const __m512i zero = _mm512_setzero_si512();
+#define STRATA_IQ2S_SPLIT(i_, i7_, h3_) \
+    { \
+        const __m512i ig = iq2s_idx(xg[i_]), iu = iq2s_idx(xu[i_]); \
+        i7_ = _mm512_inserti64x4(_mm512_castsi256_si512(_mm512_cvtepi16_epi8(_mm512_and_si512(ig, m7f))), \
+                                 _mm512_cvtepi16_epi8(_mm512_and_si512(iu, m7f)), 1); \
+        h3_ = _mm512_inserti64x4(_mm512_castsi256_si512(_mm512_cvtepi16_epi8(_mm512_srli_epi16(ig, 7))), \
+                                 _mm512_cvtepi16_epi8(_mm512_srli_epi16(iu, 7)), 1); \
+    }
+#define STRATA_IQ2S_BLOCK(i_, L_, H_) \
+    { \
+        const int i = i_; \
+        const __m512i L = L_, H = H_; \
+        const float dg = GGML_CPU_FP16_TO_FP32_LOCAL(xg[i].d) * y[i].d; \
+        const float du = GGML_CPU_FP16_TO_FP32_LOCAL(xu[i].d) * y[i].d; \
+        const __m512i scg = iq2s_scales(xg[i]), scu = iq2s_scales(xu[i]); \
+        const uint8_t* sgn_g = xg[i].qs + QK_K / 8; \
+        const uint8_t* sgn_u = xu[i].qs + QK_K / 8; \
+        __m512i ag = _mm512_setzero_si512(), au = _mm512_setzero_si512(); \
+        for (int p = 0; p < 4; ++p) { \
+            const __m512i q8 = _mm512_loadu_si512((const void*) (y[i].qs + 64 * p)); \
+            const __m512i sidx = _mm512_load_si512(sc_idx_b[p]); \
+            uint64_t sg, su; \
+            std::memcpy(&sg, sgn_g + 8 * p, 8); \
+            std::memcpy(&su, sgn_u + 8 * p, 8); \
+            const __m512i wg = _mm512_shuffle_epi8(lut, _mm512_and_si512(_mm512_multishift_epi64_epi8(shifts, \
+                                   _mm512_permutex2var_epi8(L, _mm512_load_si512(ex_b[p]), H)), m3)); \
+            const __m512i wu = _mm512_shuffle_epi8(lut, _mm512_and_si512(_mm512_multishift_epi64_epi8(shifts, \
+                                   _mm512_permutex2var_epi8(L, _mm512_load_si512(ex_b[4 + p]), H)), m3)); \
+            const __m512i dg8 = _mm512_maddubs_epi16(wg, _mm512_mask_sub_epi8(q8, (__mmask64) sg, _mm512_setzero_si512(), q8)); \
+            const __m512i du8 = _mm512_maddubs_epi16(wu, _mm512_mask_sub_epi8(q8, (__mmask64) su, _mm512_setzero_si512(), q8)); \
+            ag = _mm512_add_epi32(ag, _mm512_madd_epi16(dg8, _mm512_permutexvar_epi16(sidx, scg))); \
+            au = _mm512_add_epi32(au, _mm512_madd_epi16(du8, _mm512_permutexvar_epi16(sidx, scu))); \
+        } \
+        accg = _mm256_fmadd_ps(_mm256_set1_ps(dg), _mm256_cvtepi32_ps(_mm256_add_epi32(_mm512_castsi512_si256(ag), _mm512_extracti64x4_epi64(ag, 1))), accg); \
+        accu = _mm256_fmadd_ps(_mm256_set1_ps(du), _mm256_cvtepi32_ps(_mm256_add_epi32(_mm512_castsi512_si256(au), _mm512_extracti64x4_epi64(au, 1))), accu); \
+    }
+    for (int i2 = 0; i2 < nb; i2 += 2) {
+        const bool two = i2 + 1 < nb;
+        __m512i i7a, h3a, i7b = zero, h3b = zero;
+        STRATA_IQ2S_SPLIT(i2, i7a, h3a)
+        if (two) STRATA_IQ2S_SPLIT(i2 + 1, i7b, h3b)
+        __m512i L0 = i7a, H0 = i7a, L1 = i7b, H1 = i7b;
+            const __mmask64 m0 = _mm512_cmpeq_epi8_mask(h3a, kk), m1 = _mm512_cmpeq_epi8_mask(h3b, kk);
+            L0 = _mm512_mask2_permutex2var_epi8(la, L0, m0, lb);
+            H0 = _mm512_mask2_permutex2var_epi8(ha, H0, m0, hb);
+            L1 = _mm512_mask2_permutex2var_epi8(la, L1, m1, lb);
+            H1 = _mm512_mask2_permutex2var_epi8(ha, H1, m1, hb);
+        STRATA_IQ2S_BLOCK(i2, L0, H0)
+        if (two) STRATA_IQ2S_BLOCK(i2 + 1, L1, H1)
+#undef STRATA_IQ2S_SPLIT
+#undef STRATA_IQ2S_BLOCK
+#else
+    // GCC / Clang: the same two-superblock pass with the lookups in a lambda over register arrays (Zen 4, GCC 15.2: this
+    // form 147 us per expert against 152 for the MSVC form, pool -1.5..2.5%; both give the same bits)
     // the code lookup of superblocks i and i + 1 (both rows) in one pass over the eight tables: 128 lookups, the
     // tables loaded once; vpermt2b merged into the index register (lanes of other tables keep their index)
     __m512i Ls[2], Hs[2];
@@ -1378,6 +1437,7 @@ inline void iq2s_pair_1t(const uint8_t* grow, const uint8_t* urow, int nb, const
         accg = _mm256_fmadd_ps(_mm256_set1_ps(dg), _mm256_cvtepi32_ps(_mm256_add_epi32(_mm512_castsi512_si256(ag), _mm512_extracti64x4_epi64(ag, 1))), accg);
         accu = _mm256_fmadd_ps(_mm256_set1_ps(du), _mm256_cvtepi32_ps(_mm256_add_epi32(_mm512_castsi512_si256(au), _mm512_extracti64x4_epi64(au, 1))), accu);
     }
+#endif
     go = 0.125f * iq2s_hsum8(accg);
     uo = 0.125f * iq2s_hsum8(accu);
 }
