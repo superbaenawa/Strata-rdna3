@@ -357,14 +357,18 @@ __device__ __forceinline__ void down_a8_body(const RdnaGr& m, const int bx, cons
         }
     }
     const int e0 = c * N + h * H;   // this slice's first element in D
+    __shared__ float gws[T];   // 2 * sigm(inj_prev[c] / HC) per token, once per block
+    if (t < T && m.a[t].apply) gws[t] = 2.0f * sigm(m.a[t].inj_prev[c] / (float) HC);
+    __syncthreads();
     // stage R'[c,h] * w_norm for every token: one flattened (token, float4) loop, loads of several tokens in flight
 #pragma unroll 4
     for (int it = t; it < T * (H / 4); it += TH) {
-        const int k = it / (H / 4), i = (it - k * (H / 4)) * 4;
+        // H / 4 = 320 items per token, a multiple of the wave: k is wave-uniform, so m.a[k] is a scalar load
+        const int k = __builtin_amdgcn_readfirstlane(it / (H / 4)), i = (it - k * (H / 4)) * 4;
         const FusedGrArgs& a = m.a[k];
         float4 r = *reinterpret_cast<const float4*>(a.R + e0 + i);
         if (a.apply) {
-            const float gw = 2.0f * sigm(a.inj_prev[c] / (float) HC);
+            const float gw = gws[k];
             const float4 b = *reinterpret_cast<const float4*>(a.bo_prev + h * H + i);
             r.x = fmaf(b.x, gw, r.x); r.y = fmaf(b.y, gw, r.y); r.z = fmaf(b.z, gw, r.z); r.w = fmaf(b.w, gw, r.w);
         }
@@ -373,9 +377,9 @@ __device__ __forceinline__ void down_a8_body(const RdnaGr& m, const int bx, cons
             if constexpr (INJ) *reinterpret_cast<float4*>(&xs[k][i]) = v;
             quant4(v, &xq[k][i >> 2], &xd[k][i >> 5], (i & 31) == 0);
     }
-    if (rg == 0) {   // the slice's sums of squares (only row group 0 publishes them)
-#pragma unroll 1
-        for (int k = 0; k < T; ++k) {
+    if (rg < T) {   // the slice's sums of squares: row group k publishes token k's (same order as one block doing all)
+        {
+            const int k = rg;
             const FusedGrArgs& a = m.a[k];
             const float gw = a.apply ? 2.0f * sigm(a.inj_prev[c] / (float) HC) : 0.0f;
             float s = 0.0f;
@@ -388,14 +392,14 @@ __device__ __forceinline__ void down_a8_body(const RdnaGr& m, const int bx, cons
                 s = fmaf(r.w, r.w, fmaf(r.z, r.z, fmaf(r.y, r.y, fmaf(r.x, r.x, s))));   // explicit: the same in every instance
             }
             const float v = wsum(s);
-            if (lane == 0) sq[wv][k] = v;
+            if (lane == 0) sq[wv][0] = v;
         }
     }
     __syncthreads();
-    if (rg == 0 && t < T) {
+    if (rg < T && t == 0) {
         float s = 0.0f;
-        for (int w = 0; w < WV; ++w) s += sq[w][t];
-        m.ss[t * 2 * HC + slice] = s;
+        for (int w = 0; w < WV; ++w) s += sq[w][0];
+        m.ss[rg * 2 * HC + slice] = s;
     }
 #pragma unroll 1
     for (int k = 0; k < T; ++k) {
@@ -465,6 +469,13 @@ __device__ __forceinline__ void q8_tail(const RdnaGr& m, int d0) {
     if (lane == 0) y->ds = q8_1_ds(d, sum);
 }
 
+// a workgroup barrier that orders LDS only: __syncthreads' workgroup fence waits for every outstanding global load in
+// WGP mode (vmcnt(0)), so the up pass's DRAM weight rows would be waited for at its first barrier instead of its dot
+__device__ __forceinline__ void lds_barrier() {
+    __builtin_amdgcn_fence(__ATOMIC_RELEASE, "workgroup", "local");
+    __builtin_amdgcn_s_barrier();
+    __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "workgroup", "local");
+}
 template <int T, bool Q8 = false, bool A8 = false>
 __device__ __forceinline__ void up_body(const RdnaGr& m, const int bx) {
 
@@ -472,58 +483,95 @@ __device__ __forceinline__ void up_body(const RdnaGr& m, const int bx) {
     __shared__ float lod[A8 ? T : 1][LR / 32];
     __shared__ __align__(16) float lo[T][LR];
     __shared__ float rs[T][HC];
+    __shared__ float injv[T][HC];
     __shared__ float g[T][HC][UC];
     const int t = threadIdx.x;
-    // four lanes per row: quarter q reads uint4 q, q+4, ..., q+36 (10 of the row's 40) - issued first, so the DRAM
-    // latency overlaps the partial folding below
+    // four lanes per row: quarter q reads uint4 q, q+4, ..., q+36 (10 of the row's 40) - issued before the fold, so
+    // the DRAM latency overlaps it
     const int rr = t >> 2, q = t & 3;          // 64 rows: stream c = rr / UC, column dd = rr % UC
     const int c = rr / UC, dd = rr - c * UC, d = bx * UC + dd, i = c * N + d;
+    // ss and the partials first, the DRAM weights after: vector loads complete in order, so the waits for rs and the
+    // fold below would otherwise wait for the weight rows too
+    constexpr int NI = (T * PR + TH - 1) / TH;
+    float ss0 = 0.0f, ss1 = 0.0f, ep = 0.0f;
+    float* rso = nullptr;
+    if (t < T * HC) {
+        const int k = t / HC, cs = t - k * HC;
+        ss0 = m.ss[k * 2 * HC + 2 * cs];
+        ss1 = m.ss[k * 2 * HC + 2 * cs + 1];
+        ep = m.a[k].eps;
+        rso = m.a[k].rs;
+    }
+    float pv[NI][2 * HC];
+#pragma unroll
+    for (int u = 0; u < NI; ++u) {
+        const int i = t + u * TH;
+        if (i < T * PR) {
+            const int k = i / PR, j = i - k * PR;
+            const float* p = m.part + (size_t) k * 2 * HC * PR + j;
+#pragma unroll
+            for (int cc = 0; cc < 2 * HC; ++cc) pv[u][cc] = p[cc * PR];
+        }
+    }
+    float rv[T], wn = m.a[0].w_norm[i];
+#pragma unroll
+    for (int k = 0; k < T; ++k) rv[k] = m.a[k].R[i];
     uint4 w[10];
     uint2 w8[10];
     float d8[10];
+    uint16_t s8[10];
     if constexpr (Q8) {
         const int8_t* qu = m.a[0].r8_up;
         const uint16_t* su = reinterpret_cast<const uint16_t*>(reinterpret_cast<const uint8_t*>(qu) + r8_soff((size_t) D * LR));
         const uint2* w2 = reinterpret_cast<const uint2*>(qu + (size_t) i * LR);
 #pragma unroll
-        for (int u = 0; u < 10; ++u) { w8[u] = ntload2(w2 + q + 4 * u); d8[u] = h2f(su[(size_t) i * (LR / 32) + ((q + 4 * u) >> 2)]); }
+        for (int u = 0; u < 10; ++u) { w8[u] = ntload2(w2 + q + 4 * u); s8[u] = su[(size_t) i * (LR / 32) + ((q + 4 * u) >> 2)]; }
     } else {
         const uint4* w4 = reinterpret_cast<const uint4*>(m.a[0].w_up + (size_t) i * LR);
 #pragma unroll
         for (int u = 0; u < 10; ++u) w[u] = ntload(w4 + q + 4 * u);
     }
-    float rv[T], wn = m.a[0].w_norm[i];
-#pragma unroll
-    for (int k = 0; k < T; ++k) rv[k] = m.a[k].R[i];
     if (t < T * HC) {
         const int k = t / HC, cs = t - k * HC;
-        const float s = m.ss[k * 2 * HC + 2 * cs] + m.ss[k * 2 * HC + 2 * cs + 1];
-        rs[k][cs] = rsqrtf(s / (float) N + m.a[k].eps);
-        if (bx == 0) m.a[k].rs[cs] = rs[k][cs];
+        const float s = ss0 + ss1;
+        rs[k][cs] = rsqrtf(s / (float) N + ep);
+        if (bx == 0) rso[cs] = rs[k][cs];
     }
-    __syncthreads();
-    for (int i = t; i < T * PR; i += TH) {
+    lds_barrier();
+#pragma unroll
+    for (int u = 0; u < NI; ++u) {
+        const int i = t + u * TH;
+        if (i >= T * PR) continue;
         const int k = i / PR, j = i - k * PR;
-        const float* p = m.part + (size_t) k * 2 * HC * PR + j;
         float s = 0.0f;
 #pragma unroll
-        for (int cc = 0; cc < HC; ++cc) s = fmaf(rs[k][cc], p[(2 * cc) * PR] + p[(2 * cc + 1) * PR], s);
+        for (int cc = 0; cc < HC; ++cc) s = fmaf(rs[k][cc], pv[u][2 * cc] + pv[u][2 * cc + 1], s);
         if (j < LR) {
             const float x = s / (float) HC;
             lo[k][j] = x / (1.0f + __expf(-x));
-            if (bx == 0) m.a[k].lo[j] = lo[k][j];
-        } else if (bx == 0 && m.a[0].w_inject != nullptr) {
-            m.a[k].inject_out[j - LR] = s;
+        } else {
+            injv[k][j - LR] = s;
         }
     }
-    __syncthreads();
+    lds_barrier();
+    if (bx == 0) {   // block 0 publishes lo and inject_out, token by token (uniform pointers: scalar loads)
+#pragma unroll 1
+        for (int k = 0; k < T; ++k) {
+            for (int j = t; j < LR; j += TH) m.a[k].lo[j] = lo[k][j];
+            if (t < HC && m.a[0].w_inject != nullptr) m.a[k].inject_out[t] = injv[k][t];
+        }
+    }
     if constexpr (A8) {   // lo -> int8 per 32 (aligned 8-lane groups of float4)
         for (int i = t; i < T * (LR / 4); i += TH) {
             const int k = i / (LR / 4), f = i - k * (LR / 4);
             const float4 v = *reinterpret_cast<const float4*>(&lo[k][4 * f]);
             quant4(v, &loq[k][f], &lod[k][f >> 3], (f & 7) == 0);
         }
-        __syncthreads();
+        lds_barrier();
+    }
+    if constexpr (Q8) {
+#pragma unroll
+        for (int u = 0; u < 10; ++u) d8[u] = h2f(s8[u]);
     }
     float acc[T];
 #pragma unroll
